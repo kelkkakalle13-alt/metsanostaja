@@ -154,4 +154,32 @@ if st.button("Hae metsätilan tiedot"):
         st.error(f"Tietojen haku epäonnistui: {virhe}")
     except KeyError:
         st.error("API-avain puuttuu Streamlitin asetuksista.")
+st.subheader("Metsäkeskuksen metsävaratiedot")
 
+if st.button("Testaa Metsäkeskuksen yhteys"):
+    try:
+        url = (
+            "https://avoin.metsakeskus.fi/"
+            "geoserver/ogc/features/v1/collections"
+        )
+
+        vastaus = requests.get(
+            url,
+            params={"f": "application/json"},
+            timeout=30,
+        )
+        vastaus.raise_for_status()
+
+        aineistot = vastaus.json().get("collections", [])
+
+        st.success("Yhteys Metsäkeskukseen toimii!")
+
+        for aineisto in aineistot:
+            nimi = aineisto.get("id", "")
+            otsikko = aineisto.get("title", "")
+
+            if "stand" in nimi.lower() or "metsävara" in otsikko.lower():
+                st.write(nimi, "-", otsikko)
+
+    except Exception as virhe:
+        st.error(f"Yhteys epäonnistui: {virhe}")
