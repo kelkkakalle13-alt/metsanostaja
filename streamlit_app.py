@@ -106,7 +106,144 @@ def hae_karttatiili(karttataso, tarkkuus, sarake, rivi):
     return f"data:{mime};base64,{kuva}"
 
 
-def muodosta_kartta_html(kiinteisto, karttataso):
+def koordinaatit_mercatoriin(lon, lat):
+    # Web Mercator (EPSG:3857), WFS:n rajaus metreinä.
+    lat = max(-85.0511, min(85.0511, lat))
+    r = 6378137.0
+    x = r * math.radians(lon)
+    y = r * math.log(math.tan(math.pi / 4 + math.radians(lat) / 2))
+    return x, y
+
+
+def kuvaile_polygonit(geometria):
+    # Palauttaa kunkin polygonin ulkorenkaan GeoJSONista.
+    if not geometria:
+        return []
+    t = geometria.get("type")
+    koord = geometria.get("coordinates") or []
+    if t == "Polygon" and koord:
+        return [koord[0]]
+    if t == "MultiPolygon":
+        return [pol[0] for pol in koord if pol]
+    return []
+
+
+def piste_sisalla(piste, rengas):
+    x, y = piste
+    sisalla = False
+    for i in range(len(rengas)):
+        ax, ay = rengas[i - 1][:2]
+        bx, by = rengas[i][:2]
+        if (ay > y) != (by > y):
+            leikkaus_x = ax + (y - ay) * (bx - ax) / (by - ay)
+            if x < leikkaus_x:
+                sisalla = not sisalla
+    return sisalla
+
+
+def suuntamerkki(a, b, c):
+    return (b[0] - a[0]) * (c[1] - a[1]) - (b[1] - a[1]) * (c[0] - a[0])
+
+
+def janat_leikkaavat(a, b, c, d):
+    # Rajojen leikkaus; riittävä metsäkuvioiden esikatselusuodatukseen.
+    eps = 1e-12
+    o1, o2 = suuntamerkki(a, b, c), suuntamerkki(a, b, d)
+    o3, o4 = suuntamerkki(c, d, a), suuntamerkki(c, d, b)
+    if o1 * o2 < -eps and o3 * o4 < -eps:
+        return True
+    for p, q, r, t in ((a, b, c, o1), (a, b, d, o2), (c, d, a, o3), (c, d, b, o4)):
+        if abs(t) < eps and min(p[0], q[0])-eps <= r[0] <= max(p[0], q[0])+eps and min(p[1], q[1])-eps <= r[1] <= max(p[1], q[1])+eps:
+            return True
+    return False
+
+
+def renkaat_leikkaavat(a, b):
+    if not a or not b:
+        return False
+    if piste_sisalla(a[0], b) or piste_sisalla(b[0], a):
+        return True
+    return any(
+        janat_leikkaavat(a[i-1], a[i], b[j-1], b[j])
+        for i in range(len(a)) for j in range(len(b))
+    )
+
+
+def geometria_osuu_kiinteistoon(kuvio, palstat):
+    kuviorenkaat = kuvaile_polygonit(kuvio)
+    palstarenkaat = [
+        rengas
+        for palsta in palstat
+        for rengas in kuvaile_polygonit(palsta.get("geometry"))
+    ]
+    return any(
+        renkaat_leikkaavat(kr, pr)
+        for kr in kuviorenkaat for pr in palstarenkaat
+    )
+
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def hae_metsakuviot(kiinteiston_json):
+    """WFS:n aluerajaushaku palstoittain, GeoJSON-muodossa.
+
+    WFS:stä haetaan palstan ympäröivät kuviot ja jätetään näytölle
+    vain palstan kanssa leikkaavat kuviot. Tämä ei vielä laske
+    kuvioiden täsmällistä pinta-alaosuutta kiinteistön sisällä.
+    """
+    palstat = kiinteiston_json.get("features", [])
+    kaikki = {}
+    rajoitettu = False
+
+    for palsta in palstat:
+        geo = palsta.get("geometry") or {}
+        pisteet = kaikki_pisteet(geo.get("coordinates", []))
+        if not pisteet:
+            continue
+        xy = [koordinaatit_mercatoriin(p[0], p[1]) for p in pisteet]
+        xmin = min(x for x, _ in xy) - 20
+        ymin = min(y for _, y in xy) - 20
+        xmax = max(x for x, _ in xy) + 20
+        ymax = max(y for _, y in xy) + 20
+        bbox = f"{xmin},{ymin},{xmax},{ymax},EPSG:3857"
+        vastaus = requests.get(
+            METSÄKESKUS_WFS,
+            params={
+                "service": "WFS",
+                "version": "2.0.0",
+                "request": "GetFeature",
+                "typeNames": "v2:stand",
+                "bbox": bbox,
+                "srsName": "EPSG:4326",
+                "outputFormat": "application/json",
+                "count": 1000,
+            },
+            timeout=60,
+        )
+        vastaus.raise_for_status()
+        try:
+            aineisto = vastaus.json()
+        except ValueError as exc:
+            virhe = vastaus.text[:400]
+            raise ValueError(f"Metsäkeskus ei palauttanut GeoJSONia: {virhe}") from exc
+        if aineisto.get("type") != "FeatureCollection":
+            raise ValueError(f"Odottamaton vastaus Metsäkeskukselta: {str(aineisto)[:400]}")
+        features = aineisto.get("features", [])
+        if len(features) >= 1000:
+            rajoitettu = True
+        for f in features:
+            tunnus = f.get("id") or json.dumps(f.get("geometry", {}), sort_keys=True)
+            kaikki[str(tunnus)] = f
+
+    # Rajataan näyttöön vain palstan kanssa päällekkäiset kuviot.
+    # Polygonien reikien käsittelyä ei vielä ole täydennetty.
+    valitut = [
+        f for f in kaikki.values()
+        if geometria_osuu_kiinteistoon(f.get("geometry"), palstat)
+    ]
+    return {"type": "FeatureCollection", "features": valitut}, rajoitettu
+
+
+def muodosta_kartta_html(kiinteisto, karttataso, metsakuviot=None):
     pisteet = []
     for palsta in kiinteisto.get("features", []):
         geometria = palsta.get("geometry") or {}
@@ -140,6 +277,10 @@ def muodosta_kartta_html(kiinteisto, karttataso):
         ensure_ascii=False,
     ).replace("<", "\\u003c")
     tiilet_json = json.dumps(karttatiilet).replace("<", "\\u003c")
+    kuviot_json = json.dumps(
+        metsakuviot or {"type": "FeatureCollection", "features": []},
+        ensure_ascii=False,
+    ).replace("<", "\\u003c")
 
     html = """<!DOCTYPE html>
 <html lang="fi">
@@ -155,9 +296,13 @@ def muodosta_kartta_html(kiinteisto, karttataso):
 const kartta = L.map('kartta', {zoomControl: true});
 const tiilet = __KARTTATIILIT__;
 const geojson = __KIINTEISTO__;
+const kuviotGeoJSON = __METSÄKUVIOT__;
 for (const tiili of tiilet) {
     L.imageOverlay(tiili.image, tiili.bounds, {interactive: false}).addTo(kartta);
 }
+const kuviot = L.geoJSON(kuviotGeoJSON, {
+    style: {color:'#1285db', weight:2, fillColor:'#218cf2', fillOpacity:0.13}
+}).addTo(kartta);
 const palstat = L.geoJSON(geojson, {
     style: {color:'#ff6500', weight:4, fillColor:'#ff6500', fillOpacity:0.08}
 }).addTo(kartta);
@@ -173,6 +318,7 @@ L.control.attribution({prefix:false}).addTo(kartta)
 </body></html>"""
     html = html.replace("__KARTTATIILIT__", tiilet_json)
     html = html.replace("__KIINTEISTO__", rajat_json)
+    html = html.replace("__METSÄKUVIOT__", kuviot_json)
     html = html.replace("__KESKI_LAT__", json.dumps(kesk_lat))
     html = html.replace("__KESKI_LON__", json.dumps(kesk_lon))
     return html
@@ -212,6 +358,8 @@ if st.button("Hae kiinteistön tiedot", type="primary"):
         with st.spinner("Haetaan kiinteistön palstoja..."):
             st.session_state["kiinteisto"] = hae_kiinteisto(tunnus)
             st.session_state["haettu_tunnus"] = syote
+            st.session_state.pop("metsakuviot", None)
+            st.session_state.pop("rajattu_tulos", None)
     except ValueError as virhe:
         st.error(str(virhe))
     except requests.RequestException:
@@ -229,13 +377,41 @@ if "kiinteisto" in st.session_state:
             "Karttapohja", list(KARTAT), horizontal=True
         )
         st.subheader("Kiinteistön palstat kartalla")
+        if st.button("Hae metsäkuviot tälle kiinteistölle"):
+            try:
+                with st.spinner("Haetaan Metsäkeskuksen metsävarakuvioita..."):
+                    kuviot, rajattu = hae_metsakuviot(tiedot)
+                st.session_state["metsakuviot"] = kuviot
+                st.session_state["rajattu_tulos"] = rajattu
+            except (requests.RequestException, ValueError) as virhe:
+                st.error(f"Metsäkeskuksen haku epäonnistui: {virhe}")
+
+        metsakuviot = st.session_state.get("metsakuviot")
+        if metsakuviot is not None:
+            st.write(f"Kiinteistön kanssa leikkaavia metsäkuvioita: **{len(metsakuviot.get('features', []))}**")
+            if st.session_state.get("rajattu_tulos"):
+                st.warning("Metsäkeskuksen kysely saavutti 1000 kuvion hakurajan. Tulos ei välttämättä sisällä kaikkia kuvioita.")
+            st.caption("Siniset rajat = metsäkuviot, oranssit = kiinteistö. Kuvio voi ulottua kiinteistön ulkopuolelle.")
         try:
             with st.spinner("Ladataan Maanmittauslaitoksen karttaa..."):
-                html = muodosta_kartta_html(tiedot, karttataso)
+                html = muodosta_kartta_html(tiedot, karttataso, metsakuviot)
             components.html(html, height=600, scrolling=False)
             st.caption("Kartta-aineisto © Maanmittauslaitos. Kartta ladataan rajatulta alueelta.")
         except (requests.RequestException, ValueError):
             st.error("Karttapohjan lataaminen epäonnistui.")
+
+        if metsakuviot is not None:
+            with st.expander("Metsäkuvioiden tiedot"):
+                for i, kuvio in enumerate(metsakuviot.get("features", []), 1):
+                    st.markdown(f"**Kuvio {i}**")
+                    st.json(kuvio.get("properties", {}))
+            st.download_button(
+                "Lataa metsäkuviot (GeoJSON)",
+                json.dumps(metsakuviot, ensure_ascii=False),
+                file_name="metsakuviot.geojson",
+                mime="application/geo+json",
+            )
+            st.info("Tämä versio näyttää kuviot ja niiden alkuperäiset tiedot. Puustotilavuutta ei vielä summata: ensin on laskettava kunkin kuvion osuus kiinteistöstä ja tarkistettava tietokenttien sisältö.")
 
         for i, palsta in enumerate(palstat, 1):
             with st.expander(f"Palsta {i}: tiedot"):
